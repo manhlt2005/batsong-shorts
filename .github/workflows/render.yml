@@ -1,0 +1,74 @@
+name: Dựng Shorts
+
+# Make gọi API repository_dispatch (event_type = render-short) kèm client_payload.job
+# Có thể chạy tay ở tab Actions bằng cách dán job JSON vào ô "job".
+on:
+  repository_dispatch:
+    types: [render-short]
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "job JSON (để chạy thử bằng tay)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: render-short
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cài ffmpeg và thư viện
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg > /dev/null
+          pip install -q -r requirements.txt
+
+      - name: Ghi job.json
+        env:
+          DISPATCH_JOB: ${{ toJSON(github.event.client_payload.job) }}
+          MANUAL_JOB: ${{ github.event.inputs.job }}
+        run: |
+          if [ -n "$MANUAL_JOB" ]; then printf '%s' "$MANUAL_JOB" > job.json; else printf '%s' "$DISPATCH_JOB" > job.json; fi
+          python -c "import json;j=json.load(open('job.json'));print('job_id:',j.get('job_id'));print('số cảnh:',len(j['pages']))"
+          echo "JOB_ID=$(python -c "import json;print(json.load(open('job.json')).get('job_id') or '${{ github.run_id }}')")" >> "$GITHUB_ENV"
+
+      - name: Dựng video bằng ffmpeg
+        run: python render.py job.json --out out --work work
+
+      - name: Đăng video và thumbnail lên Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="short-${JOB_ID}"
+          gh release delete "$TAG" -y --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" out/short.mp4 out/thumbnail.jpg out/result.json \
+            --title "$TAG" --notes "Video tự động ${JOB_ID}" --latest=false
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Báo kết quả cho Make
+        if: success()
+        run: python callback.py ok
+
+      - name: Báo lỗi cho Make
+        if: failure()
+        run: python callback.py fail || true
+
+      - name: Dọn release cũ (giữ 30 cái gần nhất)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 200 --json tagName,createdAt -q 'sort_by(.createdAt) | reverse | .[30:] | .[].tagName' \
+            | while read -r t; do gh release delete "$t" -y --cleanup-tag || true; done
